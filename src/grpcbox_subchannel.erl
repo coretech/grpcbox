@@ -28,9 +28,8 @@ start_link(Name, Channel, Endpoint, Encoding, StatsHandler) ->
 conn(Pid) ->
     gen_statem:call(Pid, conn).
 
-init([Name, Channel, Endpoint, Encoding, StatsHandler]) ->
+init([_Name, Channel, Endpoint, Encoding, StatsHandler]) ->
     process_flag(trap_exit, true),
-    gproc_pool:connect_worker(Channel, Name),
     {ok, disconnected, #data{conn=undefined,
                              info=info_map(Endpoint, Encoding, StatsHandler),
                              endpoint=Endpoint,
@@ -78,17 +77,13 @@ handle_event(_, _, _) ->
     keep_state_and_data.
 
 terminate(_Reason, _State, #data{conn=undefined,
-                                 endpoint=Endpoint,
-                                 channel=Channel}) ->
-    gproc_pool:disconnect_worker(Channel, Endpoint),
-    gproc_pool:remove_worker(Channel, Endpoint),
+                                 endpoint=_Endpoint,
+                                 channel=_Channel}) ->
     ok;
 terminate(_Reason, _State, #data{conn=Pid,
-                                 endpoint=Endpoint,
-                                 channel=Channel}) ->
+                                 endpoint=_Endpoint,
+                                 channel=_Channel}) ->
     h2_connection:stop(Pid),
-    gproc_pool:disconnect_worker(Channel, Endpoint),
-    gproc_pool:remove_worker(Channel, Endpoint),
     ok.
 
 connect(Data=#data{conn=undefined,

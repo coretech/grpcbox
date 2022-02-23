@@ -14,8 +14,6 @@
 
 -include("grpcbox.hrl").
 
--define(CHANNEL(Name), {via, gproc, {n, l, {?MODULE, Name}}}).
-
 -type t() :: any().
 -type name() :: t().
 -type transport() :: http | https.
@@ -39,6 +37,7 @@
                resolver :: module(),
                balancer :: grpcbox:balancer(),
                encoding :: grpcbox:encoding(),
+               workers = [] :: [pid()],
                interceptors :: #{unary_interceptor => grpcbox_client:unary_interceptor(),
                                  stream_interceptor => grpcbox_client:stream_interceptor()}
                              | undefined,
@@ -47,26 +46,17 @@
 
 -spec start_link(name(), [endpoint()], options()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Name, Endpoints, Options) ->
-    gen_statem:start_link(?CHANNEL(Name), ?MODULE, [Name, Endpoints, Options], []).
+    gen_statem:start_link({local, Name}, ?MODULE, [Name, Endpoints, Options], []).
 
 -spec is_ready(name()) -> boolean().
 is_ready(Name) ->
-    gen_statem:call(?CHANNEL(Name), is_ready).
+    gen_statem:call(Name, is_ready).
 
 %% @doc Picks a subchannel from a pool using the configured strategy.
 -spec pick(name(), unary | stream) -> {ok, {pid(), grpcbox_client:interceptor() | undefined}} |
                                    {error, undefined_channel | no_endpoints}.
 pick(Name, CallType) ->
-    try
-        case gproc_pool:pick_worker(Name) of
-            false -> {error, no_endpoints};
-            Pid when is_pid(Pid) ->
-                {ok, {Pid, interceptor(Name, CallType)}}
-        end
-    catch
-        error:badarg ->
-            {error, undefined_channel}
-    end.
+    gen_statem:call(Name, {pick_worker, Name, CallType}).
 
 -spec interceptor(name(), unary | stream) -> grpcbox_client:interceptor() | undefined.
 interceptor(Name, CallType) ->
@@ -78,19 +68,16 @@ interceptor(Name, CallType) ->
     end.
 
 stop(Name) ->
-    gen_statem:stop(?CHANNEL(Name)).
+    gen_statem:stop(Name).
 
 init([Name, Endpoints, Options]) ->
     process_flag(trap_exit, true),
 
-    BalancerType = maps:get(balancer, Options, round_robin),
     Encoding = maps:get(encoding, Options, identity),
     StatsHandler = maps:get(stats_handler, Options, undefined),
 
     insert_interceptors(Name, Options),
 
-    gproc_pool:new(Name, BalancerType, [{size, length(Endpoints)},
-                                        {auto_size, true}]),
     Data = #data{
         pool = Name,
         encoding = Encoding,
@@ -102,8 +89,8 @@ init([Name, Endpoints, Options]) ->
         false ->
             {ok, idle, Data, [{next_event, internal, connect}]};
         true ->
-            _ = start_workers(Name, StatsHandler, Encoding, Endpoints),
-            {ok, connected, Data}
+            L = start_workers(Name, StatsHandler, Encoding, Endpoints),
+            {ok, connected, Data#data{workers = L}}
     end.
 
 callback_mode() ->
@@ -118,18 +105,29 @@ idle(internal, connect, Data=#data{pool=Pool,
                                    stats_handler=StatsHandler,
                                    encoding=Encoding,
                                    endpoints=Endpoints}) ->
-    _ = start_workers(Pool, StatsHandler, Encoding, Endpoints),
-    {next_state, connected, Data};
+    L = start_workers(Pool, StatsHandler, Encoding, Endpoints),
+    {next_state, connected, Data#data{workers = L}};
 idle({call, From}, is_ready, _Data) ->
     {keep_state_and_data, [{reply, From, false}]};
 idle(EventType, EventContent, Data) ->
     handle_event(EventType, EventContent, Data).
 
+handle_event({call, From}, {pick_worker, Name, CallType}, #data{workers = L}) ->
+    case L of
+    [Pid|_] when is_pid(Pid) -> % FIXME implement shuffle
+        Ret = {ok, {Pid, interceptor(Name, CallType)}},
+        {keep_state_and_data, [{reply, From, Ret}]};
+    _ ->
+        {keep_state_and_data, [{reply, From, {error, no_endpoints}}]}
+    end;
+
+handle_event(info, {'EXIT', Pid, _}, Data = #data{workers = L}) ->
+    {keep_state, Data#data{workers = L -- [Pid]}};
+
 handle_event(_, _, Data) ->
     {keep_state, Data}.
 
-terminate(_Reason, _State, #data{pool=Name}) ->
-    gproc_pool:force_delete(Name),
+terminate(_Reason, _State, _) ->
     ok.
 
 insert_interceptors(Name, Interceptors) ->
@@ -164,9 +162,7 @@ insert_stream_interceptor(Name, _Type, Interceptors) ->
 
 start_workers(Pool, StatsHandler, Encoding, Endpoints) ->
     [begin
-         gproc_pool:add_worker(Pool, Endpoint),
          {ok, Pid} = grpcbox_subchannel:start_link(Endpoint, Pool, {Transport, Host, Port, SSLOptions},
              Encoding, StatsHandler),
          Pid
      end || Endpoint={Transport, Host, Port, SSLOptions} <- Endpoints].
-
