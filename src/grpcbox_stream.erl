@@ -1,8 +1,16 @@
 -module(grpcbox_stream).
 
 -include_lib("chatterbox/include/http2.hrl").
--include_lib("kernel/include/logger.hrl").
 -include("grpcbox.hrl").
+
+-ifndef(OTP_RELEASE). %% Introduced in 21
+-define(STACKTRACE(ErrorType, Error, ErrorStackTrace),
+        ErrorType:Error ->
+            ErrorStackTrace = erlang:get_stacktrace(),).
+-else.
+-define(STACKTRACE(ErrorType, Error, ErrorStackTrace),
+        ErrorType:Error:ErrorStackTrace ->).
+-endif.
 
 -behaviour(h2_stream).
 
@@ -229,8 +237,8 @@ on_receive_data(Bin, State=#state{request_encoding=Encoding,
         throw:{grpc_extended_error, #{status := Status, message := Message} = ErrorData} ->
             State2 = add_trailers_from_error_data(ErrorData, State),
             end_stream(Status, Message, State2);
-        C:E:S ->
-            ?LOG_INFO("crash: class=~p exception=~p stacktrace=~p", [C, E, S]),
+        ?STACKTRACE(C, E, S)
+            error_logger:error_msg("crash: class=~p exception=~p stacktrace=~p", [C, E, S]),
             end_stream(?GRPC_STATUS_UNKNOWN, <<>>, State)
     end.
 
